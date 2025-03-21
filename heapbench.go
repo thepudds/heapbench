@@ -38,6 +38,7 @@ import (
 	"encoding/binary"
 	"flag"
 	"fmt"
+	"log"
 	"math/rand"
 	"os"
 	"runtime"
@@ -88,6 +89,10 @@ func main() {
 	leakRate := flag.Float64("leakrate", 1, "rate of memory in `MiB/sec` to allocate and hold onto forever.")
 	garbageRate := flag.Float64("garbagerate", 16, "rate of memory in `MiB/sec` to allocate without holding onto it.")
 	stats := flag.Duration("stats", 60*time.Second, "frequency of logging RSS and CPU usage. CPU reflects the last measurment period, with 100% representing 1 logical core. RSS is instantaneous measure.")
+
+	liveKind := flag.String("livekind", "nodelist", "nodelist, nodechannel, intchannel, nodemap, intmap, nodeslice, intslice")
+	liveSize := flag.String("livesize", "medium", "small, medium, large")
+
 	flag.Parse()
 
 	// Do basic sanity check of input params.
@@ -129,16 +134,16 @@ func main() {
 	// Prepare base heap.
 	logf("start allocation of base heap...")
 	var liveMem liveMemory
-	liveMem.add(memBytes(*baseHeap * 1024 * 1024))
+	liveMem.add(*liveKind, *liveSize, memBytes(*baseHeap*1024*1024))
 	logf("finished allocation of base heap")
 
 	// Log resource usage periodically.
 	c := time.Tick(*stats)
-	_, _ = resourceUsage() // start measuring CPU usage from here
+	_, _, _ = resourceUsage() // start measuring CPU usage from here
 	go func() {
 		for range c {
-			rss, cpuPct := resourceUsage()
-			logf("rss: %.1f MiB, cpu: %.1f%%", float64(rss)/(1<<20), cpuPct)
+			rss, virt, cpuPct := resourceUsage()
+			logf("rss: %.1f MiB, virt: %.1f, cpu: %.1f%%", float64(rss)/(1<<20), float64(virt)/(1<<20), cpuPct)
 		}
 	}()
 
@@ -225,41 +230,132 @@ func processJob(j job) []byte {
 // The "approximately" is because we don't track the size of the slice itself.
 type liveMemory struct {
 	nodes []*node
+	sink  any // TODO(thepudds): for now, put all other types in here to keep them alive.
 }
 
 // add creates size bytes of memory, which we place in liveMemory.
 // The memory is created as multiple linked lists of node objects, with
 // each list having a max length of 10.
-func (m *liveMemory) add(size memBytes) {
-	nodeListDepth := 10
-	nodeSize := memBytes(unsafe.Sizeof(node{}))
-	count := int(size / nodeSize)
-	created := 0
-	for created < count {
-		head := &node{}
-		curr := head
-		created++
-		for i := 0; i < nodeListDepth-1 && created < count; i++ {
-			for j := range curr.pointers {
-				// Set the dummy pointers to something (head) so that we don't leave them nil.
-				curr.pointers[j] = head
-			}
-			curr.next = &node{}
-			curr = curr.next
+// TODO(thepudds): update comment.
+func (m *liveMemory) add(liveKind string, allocSize string, totalSize memBytes) {
+	switch liveKind {
+	case "nodelist":
+		// TODO(thepudds): this is the oldest flavor still here. update?
+		nodeSize := memBytes(unsafe.Sizeof(node{})) // maybe 64 bytes. TODO: check
+		nodeListDepth := 10
+		count := int(totalSize / nodeSize)
+		created := 0
+		var nodes []*node
+		for created < count {
+			head := &node{}
+			curr := head
 			created++
+			for i := 0; i < nodeListDepth-1 && created < count; i++ {
+				for j := range curr.pointers {
+					// Set the dummy pointers to something (head) so that we don't leave them nil.
+					curr.pointers[j] = head
+				}
+				curr.next = &node{}
+				curr = curr.next
+				created++
+			}
+			nodes = append(nodes, head)
 		}
-		m.nodes = append(m.nodes, head)
+		m.nodes = nodes
+
+	case "nodechannel":
+		elems, repeat := allocCounts[node](totalSize, allocSize)
+		var chans []chan node
+		for i := 0; i < repeat; i++ {
+			ch := make(chan node, elems)
+			ch <- node{} // use it once.
+			chans = append(chans, ch)
+		}
+		m.sink = chans
+
+	case "intchannel":
+		elems, repeat := allocCounts[int64](totalSize, allocSize)
+		var chans []chan int64
+		for i := 0; i < repeat; i++ {
+			ch := make(chan int64, elems)
+			ch <- 0 // use it once.
+			chans = append(chans, ch)
+		}
+		m.sink = chans
+
+	case "nodeslice":
+		elems, repeat := allocCounts[node](totalSize, allocSize)
+		var slices [][]node
+		for i := 0; i < repeat; i++ {
+			s := make([]node, elems)
+			slices = append(slices, s)
+		}
+		m.sink = slices
+
+	case "intslice":
+		elems, repeat := allocCounts[int64](totalSize, allocSize)
+		var slices [][]int64
+		for i := 0; i < repeat; i++ {
+			s := make([]int64, elems)
+			slices = append(slices, s)
+		}
+		m.sink = slices
+
+	case "nodemap":
+		elems, repeat := allocCounts[node](totalSize, allocSize)
+		repeat /= 2 // map is ~2x bigger than slice
+		var maps []map[node]node
+		for i := 0; i < repeat; i++ {
+			m := make(map[node]node, elems)
+			maps = append(maps, m)
+		}
+		m.sink = maps
+
+	case "intmap":
+		elems, repeat := allocCounts[int64](totalSize, allocSize)
+		repeat /= 2 // map is ~2x bigger than slice
+		var maps []map[int64]int64
+		for i := 0; i < repeat; i++ {
+			m := make(map[int64]int64, elems)
+			maps = append(maps, m)
+		}
+		m.sink = maps
+
+	default:
+		log.Fatalf("unknown live kind: %s", liveKind)
 	}
 }
 
-// leak adds memory to our live memory in a loop at a constant rate.
 func (m *liveMemory) leak(byteRate memBytesPerSec) {
 	const leaksPerSec = 10
 	bytesPerTicker := memBytes(byteRate / leaksPerSec)
 	ticker := time.NewTicker(time.Second / leaksPerSec)
 	for range ticker.C {
-		m.add(bytesPerTicker)
+		// For now, continue to always leak to the node list.
+		m.add("nodelist", "na", bytesPerTicker)
 	}
+}
+
+// allocCounts reports approximately how many times you need to repeat make(..., elems)
+// to get totalSize bytes of memory, with some control via allocSize of the size of
+// individual allocations. It ignores overheads.
+func allocCounts[T any](totalSize memBytes, allocSize string) (elems int, repeat int) {
+	var t T
+	elemSize := int(unsafe.Sizeof(t))
+	switch allocSize {
+	case "small":
+		elems = 64 / elemSize // ~64 byte allocations
+	case "medium":
+		elems = 6400 / elemSize // ~6.4 KiB allocations
+	case "large":
+		elems = 33 * 1024 / elemSize // ~33 KiB allocations
+	default:
+		log.Fatalf("unknown alloc size: %s", allocSize)
+	}
+	repeat = int(totalSize / memBytes(elemSize*elems))
+	fmt.Fprintf(os.Stderr, "heapbench: total approx. live goal: %.1f MiB, planning to alloc approx. %d bytes %dx times via make(..., %d) for elems of size %d bytes, repeat*elems*sizeof: %.1f MiB\n",
+		float64(totalSize)/(1024*1024), elems*elemSize, repeat, elems, elemSize, float64(repeat*elems*elemSize)/(1024*1024))
+	return elems, repeat
 }
 
 // varints holds input data for our fake CPU work.
@@ -303,7 +399,7 @@ func fakeCPUWork(loopCount int) uint64 {
 }
 
 // resourceUsage reports our RSS in bytes and CPU percent utilization, where 100% is the equivalent of 1 logical core.
-func resourceUsage() (rss int, cpuPct float64) {
+func resourceUsage() (rss int, virt int, cpuPct float64) {
 	proc := must(process.NewProcess(int32(os.Getpid())))
 	mem := must(proc.MemoryInfo())
 	// Duration of 0 gives cpu usage since the last call.
@@ -311,8 +407,8 @@ func resourceUsage() (rss int, cpuPct float64) {
 	if len(pcts) != 1 {
 		panic(fmt.Errorf("heapbench: expected a single total cpu percentage, got: %d", len(pcts)))
 	}
-	pct := pcts[0] * float64(runtime.NumCPU())
-	return int(mem.RSS), pct
+	cpuPct = pcts[0] * float64(runtime.NumCPU())
+	return int(mem.RSS), int(mem.VMS), cpuPct
 }
 
 func expDuration(mean time.Duration) time.Duration {
