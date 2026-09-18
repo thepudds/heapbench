@@ -22,20 +22,20 @@ go install github.com/thepudds/heapbench@latest
     This example uses ~2 cores:
 
     ```
-    heapbench -baseheap=0 -garbagerate=0 -leakrate=0 -jobrate=100 -worktime=20ms
+    heapbench -baseheap=0 -garbagerate=0 -leakrate=0 -jobrate=100 -worktime=20ms -benchtime=30m
     ```
 
     This specifies an average job arrival rate of 100/sec (i.e., 10ms average between job starts),
-    with each job averaging 20ms of CPU wok, and no material memory being allocated.
-    Jobs arriving twice as fast as the quantity of work in each job means it 
+    with each job averaging 20ms of CPU work, and no material memory being allocated.
+    Jobs arriving twice as fast as the quantity of work in each job means it
     uses very close to 2 CPU cores on average (e.g., as seen via `top -d 60` or similar).
 
  2. **CPU + GC work**
-    
+
     This adds in a base heap, garbage generation, and leak:
 
     ```
-    heapbench -baseheap=128 -garbagerate=128 -leakrate=1 -jobrate=100 -worktime=20ms
+    heapbench -baseheap=128 -garbagerate=128 -leakrate=1 -jobrate=100 -worktime=20ms -benchtime=30m
     ```
 
     Here we have the same pure CPU work as the prior example, but now with a baseline of 128 MB of live memory (memory being held onto), which increases at a
@@ -49,27 +49,40 @@ go install github.com/thepudds/heapbench@latest
 Usage of heapbench
 
 Memory:
+
   -baseheap MiB
         initial amount of memory in MiB to allocate and hold onto forever. (default 128)
   -garbagerate MiB/sec
         rate of memory in MiB/sec to allocate without holding onto it. (default 16)
+  -objectsize bytes
+        average size of garbage objects allocated. (default 512)
   -leakrate MiB/sec
-        rate of memory in MiB/sec to allocate and hold onto forever. (default 1)
+        rate of memory in MiB/sec to allocate and hold onto forever. (default 0)
 
 CPU:
+
   -jobrate jobs/sec
-        average arrival rate in jobs/sec. For example, with '-arrivalrate=100 -worktime=20ms', 
+        average arrival rate in jobs/sec. For example, with '-jobrate=100 -worktime=20ms',
         2 jobs will be getting processed simultaneously on average. (default 100)
   -worktime duration
-        average service time for each job. Cannot be set with -workloops.
+        average service time each job spends exercising a core. Cannot be set with -workloops.
   -workloops million
         do an average of N million tight loops per job. A value of 1 translates to roughly
         5-20ms, depending on hardware. Cannot be set with -worktime.
 
-Logging:         
+OS statistics:
+
   -stats duration
-        frequency of logging RSS and CPU usage. CPU reflects the last measurement period, 
+        frequency of logging RSS and CPU usage. CPU reflects the last measurement period,
         with 100% representing 1 logical core. RSS is instantaneous measure. (default 60s)
+
+Execution:
+
+  -benchtime duration
+        total duration to run the benchmark. (default 1h)
+  -cpuprofile file
+        write CPU profile to file.
+
 ```
 
 ### Additional Details

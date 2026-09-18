@@ -38,9 +38,11 @@ import (
 	"encoding/binary"
 	"flag"
 	"fmt"
+	"log"
 	"math/rand"
 	"os"
 	"runtime"
+	"runtime/pprof"
 	"time"
 	"unsafe" // for unsafe.Sizeof
 
@@ -62,9 +64,10 @@ type node struct {
 
 // job is a unit of work. We only set duration or loopCount.
 type job struct {
-	duration  time.Duration // spin duration for one job
-	loopCount int           // number of decoding loops for one job
-	garbage   memBytes      // bytes of garbage to create in one job
+	duration   time.Duration // spin duration for one job
+	loopCount  int           // number of decoding loops for one job
+	garbage    memBytes      // bytes of garbage to create in one job
+	objectSize memBytes      // average size of garbage objects allocated
 }
 
 // Some units.
@@ -81,14 +84,30 @@ func main() {
 			a...)
 	}
 
-	jobArrivalRate := flag.Float64("jobrate", 100, "average arrival rate in `jobs/sec`. For example, with '-arrivalrate=100 -worktime=20ms', 2 jobs will be getting processed simultaneously on average.")
+	jobArrivalRate := flag.Float64("jobrate", 100, "average arrival rate in `jobs/sec`. For example, with '-jobrate=100 -worktime=20ms', 2 jobs will be getting processed simultaneously on average.")
 	workTime := flag.Duration("worktime", 0, "average service time for each job. Cannot be set with -workloops")
 	workLoops := flag.Float64("workloops", 0, "do an average of N `million` tight loops per job. A value of 1 translates to roughly 5-20ms, depending on hardware. Cannot be set with -worktime")
 	baseHeap := flag.Float64("baseheap", 128, "initial amount of memory in `MiB` to allocate and hold onto forever.")
-	leakRate := flag.Float64("leakrate", 1, "rate of memory in `MiB/sec` to allocate and hold onto forever.")
+	leakRate := flag.Float64("leakrate", 0, "rate of memory in `MiB/sec` to allocate and hold onto forever.")
 	garbageRate := flag.Float64("garbagerate", 16, "rate of memory in `MiB/sec` to allocate without holding onto it.")
-	stats := flag.Duration("stats", 60*time.Second, "frequency of logging RSS and CPU usage. CPU reflects the last measurment period, with 100% representing 1 logical core. RSS is instantaneous measure.")
+	objectSize := flag.Int("objectsize", 512, "average `size` of garbage objects allocated. Varies uniformly between 1 byte and size*2 bytes.")
+	stats := flag.Duration("stats", 60*time.Second, "frequency of logging RSS and CPU usage. CPU reflects the last measurement period, with 100% representing 1 logical core. RSS is instantaneous measure.")
+	cpuprofile := flag.String("cpuprofile", "", "write cpu profile to `file`")
+	benchtime := flag.Duration("benchtime", time.Hour, "total duration to run benchmark.")
+
 	flag.Parse()
+
+	if *cpuprofile != "" {
+		f, err := os.Create(*cpuprofile)
+		if err != nil {
+			log.Fatal("could not create CPU profile: ", err)
+		}
+		defer f.Close()
+		if err := pprof.StartCPUProfile(f); err != nil {
+			log.Fatal("could not start CPU profile: ", err)
+		}
+		defer pprof.StopCPUProfile()
+	}
 
 	// Do basic sanity check of input params.
 	if *workTime != 0 && *workLoops != 0 {
@@ -97,6 +116,10 @@ func main() {
 	}
 	if *jobArrivalRate < 1 {
 		logf("low job arrival rates lead to lumpy garbage generation and work, and might not be what you expect")
+		os.Exit(2)
+	}
+	if *objectSize < 16 {
+		logf("object size must be at least 16 bytes")
 		os.Exit(2)
 	}
 
@@ -125,6 +148,8 @@ func main() {
 	logf("leak rate: %.1f MiB/s", *leakRate)
 	logf("garbage rate: %.1f MiB/s", *garbageRate)
 	logf("garbage per job: %d bytes", bytesPerJob)
+	logf("garbage object avg size: %d bytes", *objectSize)
+	logf("stop after benchmark duration: %v", *benchtime)
 
 	// Prepare base heap.
 	logf("start allocation of base heap...")
@@ -150,13 +175,14 @@ func main() {
 
 	logf("start benchmark...")
 	go liveMem.leak(memBytesPerSec(*leakRate * 1024 * 1024))
-	generateJobs(interArrivalAvg, *workTime, *workLoops*1e6, bytesPerJob)
+	generateJobs(*benchtime, interArrivalAvg, *workTime, *workLoops*1e6, bytesPerJob, memBytes(*objectSize))
 }
 
-// generateJobs loops forever creating jobs.
-func generateJobs(interArrivalAvg time.Duration, workTimeAvg time.Duration, workLoopsAvg float64, bytesPerJob memBytes) {
+// generateJobs loops creating jobs until benchtime elapses.
+func generateJobs(benchtime time.Duration, interArrivalAvg time.Duration, workTimeAvg time.Duration, workLoopsAvg float64, bytesPerJob memBytes, objectSize memBytes) {
+	start := time.Now()
 	var extraSleep time.Duration // Positive when we sleep longer than asked.
-	for {
+	for time.Since(start) < benchtime {
 		// Calculate an inter-arrival time based on an exponential distribution, then sleep.
 		// We track and correct if we sleep too long or not long enough.
 		interArrival := expDuration(interArrivalAvg)
@@ -167,7 +193,10 @@ func generateJobs(interArrivalAvg time.Duration, workTimeAvg time.Duration, work
 		extraSleep = slept - desiredSleep
 
 		// Define the next job.
-		j := job{garbage: bytesPerJob}
+		j := job{
+			garbage:    bytesPerJob,
+			objectSize: objectSize,
+		}
 		if workLoopsAvg != 0 {
 			// Calcuate the work for this job using an exponential distribution of loop counts.
 			j.loopCount = int(expFloat(workLoopsAvg))
@@ -187,12 +216,13 @@ func processJob(j job) []byte {
 	var throwaway []byte
 
 	// Create garbage of variable size.
-	// Currently averages roughly 512 bytes per alloc.
+	// Defaults to average of roughly 512 bytes per alloc.
 	// It is "roughly" because the exact average depends on how many we allocate,
 	// there is rounding up to size classes, etc.
 	count := 0
 	for j.garbage > 0 {
-		allocSize := memBytes(count%1024 + 1)
+		allocSize := memBytes(count%(int(j.objectSize)*2) + 1)
+		allocSize = max(allocSize, 16) // avoid tiny allocator, at least for now.
 		if allocSize > j.garbage {
 			allocSize = j.garbage
 		}
